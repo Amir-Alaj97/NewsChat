@@ -58,7 +58,9 @@ class GraphState(Enum):
 class QueryState(TypedDict):
     user_query: str
     messages: Annotated[list[AnyMessage], add_messages]
-    categories: list[str, dict]
+    categories_and_keywords: list[Union[str, dict]]
+    categories: list[str]
+    tags: list[str]
     date: list[str]
     language: str
     country: str
@@ -77,8 +79,11 @@ FETCH_CONTEXT_FROM_VECTOR_DB = "fetch_context_from_vector_db"
 
 
 class QueryTags(BaseModel):
-    categories: list[Union[str, dict]] = Field(description="List of categories defined based on the input. If category was formulated using key words store as dictionay: [{{category defined:key words used}}]")
-    date: list[str] = Field(description="Date or dates inputted by the user. If no date is present use todays date")
+    categories_and_keywords: list[Union[str, dict]] = Field(description="List of categories defined based on the input. If category was formulated using key words store as dictionay: [{{category defined:key words used}}]")
+
+    date: list[str] = Field(description="Date or dates inputted by the user. If no date is present use todays date\
+                            Convert date format to YYYY-MM-DD, store in list even if there is one, and sort older to sooner.\
+                            If date is not explicitly defined default to blank space")
     language: str = Field(description="Language found from user input. Use language code if found, and default to blank space if not found")
     country: str = Field(description="Country found from user input. Use country code if found, and default to blank space if not found")
 
@@ -118,8 +123,22 @@ def get_final_answer_prompt(context, user_query):
                                  "summarize and give a list of bulleted points to the user. "
                                  "DO NOT GUESS or ADD any points on your own.")
 
+def extract_keys_and_values(category: list[Union[str, dict]]):
+    keys_list = []
+    values_list = []
+
+    for item in category:
+        if isinstance(item, dict): 
+            keys_list.extend(item.keys()) 
+            values_list.extend(word.strip() for values in item.values() for word in values.split(","))
+        elif isinstance(item, str): 
+            keys_list.append(item)  
+
+    return keys_list, values_list
+
 def extract_tags_and_category(tool_message):
     categories = []
+    tags = []
     date = []
     language = ""
     country = ""
@@ -130,59 +149,69 @@ def extract_tags_and_category(tool_message):
             import json
             try:
                 parsed_arguments = json.loads(function_call['arguments'])
-                categories = parsed_arguments.get("categories", [])
+                categories_and_keywords = parsed_arguments.get("categories_and_keywords", [])
+                categories, tags = extract_keys_and_values(categories_and_keywords)
                 date = parsed_arguments.get("date", [])
                 language = parsed_arguments.get("language", "")
                 country = parsed_arguments.get("country", "")
-                print("Catgories:", categories)
+                print("Categories:", categories)
+                print("Tags:", tags)
                 print("date:", date)
                 print("Language:", language)
                 print("Country:", country)
             except json.JSONDecodeError:
                 print("Failed to parse arguments")
-    return categories, date, language, country
+
+    return categories_and_keywords, categories, tags, date, language, country
 
 def user_query_analyzer(state: QueryState):
     todaysDate = datetime.today().strftime("%Y-%m-%d")
     print(f"🟡 In user query analyzer... ")
     chain = user_query_analysis_prompt | llm_with_functions
     topics_identified = chain.invoke({"input": state["user_query"], "today": todaysDate})
+    print(f"🔔🔔🔔🔔 {topics_identified}")
     categories = []
     date = []
     language = ""
     country = ""
     if hasattr(topics_identified, "additional_kwargs"):
-        categories, date, language, country = extract_tags_and_category(topics_identified.additional_kwargs)
-
-    return {"messages": [topics_identified], "categories": categories, "date": date, "language":language, "country":country, "graph_state": GraphState.USER_QUERY_ANALYSIS_COMPLETE}
+        categories_and_keywords, categories, tags, date, language, country = extract_tags_and_category(topics_identified.additional_kwargs)
+        
+    return {"messages": [topics_identified], 
+            "categories_and_keywords": categories_and_keywords,
+            "categories": categories, 
+            "tags": tags, 
+            "date": date, "language":language, 
+            "country":country, "graph_state": 
+            GraphState.USER_QUERY_ANALYSIS_COMPLETE}
 
 def fetch_existing_docs_from_vectordb(state: QueryState):
     print("🟡 Checking if docs are in Chroma...")
     existing_docs = []
-    if(state["tags"] or state["category"]):
-        existing_docs = search_news_by_tags_and_category(tags=state["tags"], category=state["category"])
+    if(state["categories"] or state["tags"]):
+        existing_docs = search_news_by_tags_and_category(categories=state["categories"], tags=state["tags"])
     if existing_docs:
-        return {"messages": state["messages"], "categories": state["categories"], "date": state["date"], "language":state["language"], "country":state["country"], "context": existing_docs, "graph_state": GraphState.EXISTING_DOCS_FOUND}
+        return {"messages": state["messages"], "categories": state["categories"], "tags":state["tags"], "date": state["date"], "language":state["language"], "country":state["country"], "news_articles": existing_docs, "graph_state": GraphState.EXISTING_DOCS_FOUND}
     else:
-        return {"messages": state["messages"], "categories": state["categories"], "date": state["date"], "language":state["language"], "country":state["country"], "context": existing_docs, "graph_state": GraphState.API_FETCH_IN_PROGRESS}
+        return {"messages": state["messages"], "categories": state["categories"], "tags":state["tags"], "date": state["date"], "language":state["language"], "country":state["country"], "news_articles": existing_docs, "graph_state": GraphState.API_FETCH_IN_PROGRESS}
 
     
 def execute_news_fetch(state: QueryState):
     print(f"🟡 Fetching news via API")
-    news_articles = get_news(state["categories"], state["date"], state["language"], state["country"])
+    news_articles = get_news(state["categories_and_keywords"], state["date"], state["language"], state["country"])
     print(news_articles)
-    return {"messages": state["messages"],  "categories": state["categories"], "date": state["date"], "language":state["language"], "country":state["country"], "news_articles": news_articles, "graph_state": GraphState.STORE_IN_PROGRESS}
+    return {"messages": state["messages"],  "categories": state["categories"], "tags":state["tags"], "date": state["date"], "language":state["language"], "country":state["country"], "news_articles": news_articles, "graph_state": GraphState.STORE_IN_PROGRESS}
     
 def store_in_vector_db(state: QueryState):
     print("🟡 Storing the fetched articles in vector db")
     if(state["news_articles"]):
-        store_news(state["news_articles"], state["category"], state["tags"])
+        store_news(state["news_articles"], state["categories"], state["tags"])
     state["graph_state"] = GraphState.FETCH_CONTEXT_IN_PROGRESS
     return state
 
 def fetch_context_from_vector_db(state: QueryState):
     print("🟡 Fetching the most relevant chunks from vector db")
-    context = search_news(state["user_query"], state["tags"], state["category"], top_k=10)
+    context = search_news(state["user_query"], state["tags"], state["categories"], top_k=10)
     state["context"] = context
     state["news_articles"] = context
     state["graph_state"] = GraphState.SUMMARISATION_IN_PROGESS
@@ -224,8 +253,8 @@ def fetch_existing_docs_condition(state: QueryState):
 
 def fetch_news_from_api_condition(state: QueryState):
     
-    if state["context"]:
-        return SUBMIT_FINAL_ANSWER
+    if state["news_articles"]:
+        return FETCH_CONTEXT_FROM_VECTOR_DB
     else:
         return EXECUTE_NEWS_FETCH
     
@@ -253,7 +282,6 @@ def compileGraph(graphState):
 
     memory = MemorySaver()
     react_graph = builder.compile(checkpointer=memory)
-
     return react_graph
 
 
@@ -275,9 +303,9 @@ def record_and_transcribe(recognizer):
     recognizer.pause_threshold = 2
     recognizer.dynamic_energy_adjustment_damping = 0.1
     with sr.Microphone() as source:
-        print("Adjusting for ambient noise...")
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        print("Listening for your input (say Quit to exit the program)...")
+        with st.chat_message("AI"):
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            st.write("Listening... (say Quit to exit)")
         try:
             audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
             with open(".\\audio.wav", "wb") as f:
@@ -296,67 +324,73 @@ def record_and_transcribe(recognizer):
             print(f"Error: {e}") 
 
 def run_streamlit_ui(recognizer):
-    st.title("Daily News Podcast Agent!")  # Set the title of the app
-    st.markdown(
-        """
-        <style>
-            /* Target all Streamlit buttons */
-            div.stButton > button {
-                font-size: 8px !important;  /* Adjust font size */
-                padding: 4px 10px !important;  /* Adjust padding */
-            }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+    st.title("Daily News Podcast Agent!")  
+
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = [
             AIMessage(content="Hello, What are you interested in hearing about today?"),
         ]
 
-    for message in st.session_state.chat_history:
-        if isinstance(message, AIMessage):
-            with st.chat_message("AI"):
+    if "user_query" not in st.session_state:
+        st.session_state.user_query = ""
+
+    # Display chat messages
+    chat_container = st.container()  # Create a container for scrolling
+    with chat_container:
+        for message in st.session_state.chat_history:
+            role = "AI" if isinstance(message, AIMessage) else "Human"
+            with st.chat_message(role):
                 st.write(message.content)
 
-        elif isinstance(message, HumanMessage):
-            with st.chat_message("Human"):
-                st.write(message.content)
-
-    col1, col2 = st.columns([4, 1])
-    with col1:
-    # Typing input box
-        user_query = st.text_input("Enter your daily news query here...")  # Input for user query
-    with col2:
-    # Button placed to the right of the text input box
-        if st.button("🎤 Speak Instead"):
+    # User Input Form
+    with st.form("user_input_form"):
+        user_query = st.text_input("Enter your daily news query here...", key="user_input", placeholder="Type here...")
+        if st.form_submit_button("🎤 Speak Instead"):
             recognizer = sr.Recognizer()
             user_query = record_and_transcribe(recognizer)
 
     thread = {"configurable": {"thread_id": "1"}}
-    initial_input = {"user_query": user_query, "messages": st.session_state.chat_history, "tags": [], "news_articles": [], "category":"", "graph_state": GraphState.USER_QUERY_ANALYSIS_STARTED}
+    initial_input = {
+        "user_query": user_query, 
+        "messages": st.session_state.chat_history, 
+        "tags": [], "news_articles": [], 
+        "category": "", 
+        "graph_state": GraphState.USER_QUERY_ANALYSIS_STARTED
+    }
     react_graph = compileGraph(initial_input)
 
-    if user_query is not None and user_query != "":
+    if user_query is not None and user_query != "":  # Ensure query is not empty
         st.session_state.chat_history.append(HumanMessage(content=user_query))
 
         with st.chat_message("Human"):
             st.markdown(user_query)
-        
+
         ai_response = ""
         graph_state = GraphState.USER_QUERY_ANALYSIS_STARTED
         
         with st.status(graph_state.value):
             for event in react_graph.stream(initial_input, thread, stream_mode="values"):
                 graph_state = event["graph_state"]
-                ai_response = (event['messages'][-1].content)  
-                #print(ai_response)
-                print(graph_state.value)
+                ai_response = event['messages'][-1].content  
                 st.write(graph_state.value)
 
         st.session_state.chat_history.append(AIMessage(content=ai_response))
         with st.chat_message("AI"):
             st.write(ai_response)
+
+        st.session_state.user_query = ""
+        st.rerun()
+
+    st.markdown("""
+        <script>
+            setTimeout(() => {
+                var chatContainer = window.parent.document.querySelector('section.main');
+                if (chatContainer) {
+                    chatContainer.scrollTo({ top: chatContainer.scrollHeight, behavior: 'smooth' });
+                }
+            }, 200);
+        </script>
+    """, unsafe_allow_html=True)
 
 # Add CSS for blinking effect
 st.markdown("""
@@ -372,4 +406,3 @@ if __name__ == "__main__":
     recognizer = sr.Recognizer()
     run_streamlit_ui(recognizer)
     pass
-
